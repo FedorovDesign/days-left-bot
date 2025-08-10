@@ -1,10 +1,13 @@
 import 'dotenv/config';
-import { Telegraf, Markup } from 'telegraf';
+import { Telegraf } from 'telegraf';
 import { DateTime } from 'luxon';
 import fs from 'fs';
+import path from 'path';
 
-// === Конфиг текста ===
-// Функция главной строки. Можешь менять формулировку.
+// ====== ВЛАДЕЛЕЦ (кто может менять настройки) ======
+const OWNER_IDS = [661057299]; // <-- твой Telegram user id
+
+// ====== ТЕКСТЫ ======
 function plural(n, one, few, many) {
   const n10 = n % 10, n100 = n % 100;
   if (n10 === 1 && n100 !== 11) return one;
@@ -16,11 +19,10 @@ function mainLine(days) {
   return `До возможной легендарной встречи осталось ${days} ${word}, а может и не легендарной, посмотрим.`;
 }
 
-// Список доп. фраз. Пиши свои 10 штук — будут крутиться по дням.
+// Дополнительные фразы — меняются по дню (псевдослучайно от даты)
 const EXTRA_LINES = [
   'Если Дениса отпустят к нам',
   'Если Иля решится взять свою бричку и доехать вместе с Расимом',
-  // добавляй ещё варианты ниже
   'Если все соберутся без опозданий',
   'Если погода скажет: “да”',
   'Если всё совпадёт как надо',
@@ -31,26 +33,64 @@ const EXTRA_LINES = [
   'Если удача будет на нашей стороне'
 ];
 
-// === Хранилище в файле (перечатовые настройки) ===
+function dailyExtraLine(tzOffset) {
+  const zone = `UTC${tzOffset}`;
+  const idx = DateTime.now().setZone(zone).ordinal % EXTRA_LINES.length;
+  return EXTRA_LINES[idx];
+}
+
+// Картинки — РАНДОМ из списка (каждый раз новая)
+const EXTRA_IMAGES = [
+  'https://i.imgur.com/yxy2Yyj.png',
+  'https://i.imgur.com/RID6Qt9.png',
+  'https://i.imgur.com/iIovm0s.png',
+  'https://i.imgur.com/krFtqbg.png',
+  'https://i.imgur.com/toB8RbD.png',
+  'https://i.imgur.com/nup8ect.png',
+  'https://i.imgur.com/LXF5SGP.png',
+];
+function randomImageUrl() {
+  if (!EXTRA_IMAGES.length) return null;
+  const i = Math.floor(Math.random() * EXTRA_IMAGES.length);
+  return EXTRA_IMAGES[i];
+}
+
+// ====== ХРАНИЛИЩЕ (файл) ======
 const STORE_PATH = process.env.STORE_PATH || './store.json';
+
+function ensureDirExists(filePath) {
+  const dir = path.dirname(filePath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+}
 function loadStore() {
-  try { return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')); }
-  catch { return {}; }
+  try {
+    ensureDirExists(STORE_PATH);
+    if (!fs.existsSync(STORE_PATH)) return {};
+    return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
+  } catch { return {}; }
 }
 function saveStore(obj) {
-  fs.writeFileSync(STORE_PATH, JSON.stringify(obj, null, 2));
+  try {
+    ensureDirExists(STORE_PATH);
+    fs.writeFileSync(STORE_PATH, JSON.stringify(obj, null, 2));
+  } catch (e) {
+    console.error('Failed to save store:', e.message);
+  }
 }
-let store = loadStore();
-// Структура: store[chatId] = { target_date: 'YYYY-MM-DD' | null, tz_offset: '+04:00', notify: false, last_notified_iso: 'YYYY-MM-DD' | null }
 
-function ensureChat(chatId) {
+let store = loadStore();
+// структура: store[chatId] = { target_date, tz_offset, notify, last_notified_iso }
+
+function ensureChat(chatId, chatType) {
   if (!store[chatId]) {
-    store[chatId] = { target_date: null, tz_offset: '+00:00', notify: false, last_notified_iso: null };
+    // в группах авто-уведомления включены по умолчанию; в личке — выключены
+    const defaultNotify = (chatType === 'group' || chatType === 'supergroup');
+    store[chatId] = { target_date: null, tz_offset: '+04:00', notify: defaultNotify, last_notified_iso: null };
     saveStore(store);
   }
 }
 
-// === Утилиты дат ===
+// ====== ДАТЫ ======
 function parseDate(input) {
   let dt = DateTime.fromFormat(String(input).trim(), 'yyyy-MM-dd', { zone: 'utc' });
   if (!dt.isValid) dt = DateTime.fromFormat(String(input).trim(), 'dd.MM.yyyy', { zone: 'utc' });
@@ -67,69 +107,89 @@ function calcDaysLeft(targetISO, tzOffset) {
   const target = DateTime.fromISO(targetISO, { zone }).startOf('day');
   return Math.floor(target.diff(now, 'days').days);
 }
-function todayISO(tzOffset) {
-  const zone = `UTC${tzOffset}`;
-  return DateTime.now().setZone(zone).startOf('day').toISODate();
-}
-function dailyExtraLine(tzOffset) {
-  const zone = `UTC${tzOffset}`;
-  const dayIndex = DateTime.now().setZone(zone).ordinal % EXTRA_LINES.length;
-  return EXTRA_LINES[dayIndex];
-}
 
-// === Бот ===
+// ====== БОТ ======
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+const isGroup = (ctx) => ['group', 'supergroup'].includes(ctx.chat?.type);
+const isOwner = (ctx) => OWNER_IDS.includes(ctx.from?.id);
 
-// Кнопочное меню (inline-кнопки под сообщением)
-function menuKeyboard(chatId) {
-  const cfg = store[chatId] || {};
-  const notifyLabel = cfg.notify ? '🔕 Отключить 08:00' : '🔔 Включить 08:00';
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('⏳ Сколько осталось', 'ACTION_LEFT')],
-    [Markup.button.callback('📅 Какая дата', 'ACTION_WHEN')],
-    [Markup.button.callback(notifyLabel, 'ACTION_TOGGLE_NOTIFY')],
-    [Markup.button.callback('🌍 Часовой пояс', 'ACTION_TZ_HELP')],
-    [Markup.button.callback('🧼 Сбросить дату', 'ACTION_CLEAR')]
-  ]);
+// Универсальная отправка: фото (рандом) + подпись, иначе просто текст
+async function sendWithRandomImage(ctxOrBot, chatId, text) {
+  const url = randomImageUrl();
+  try {
+    if (url) {
+      if (ctxOrBot.telegram) {
+        await ctxOrBot.telegram.sendPhoto(chatId, url, { caption: text });
+      } else {
+        await ctxOrBot.replyWithPhoto(url, { caption: text });
+      }
+    } else {
+      if (ctxOrBot.telegram) {
+        await ctxOrBot.telegram.sendMessage(chatId, text);
+      } else {
+        await ctxOrBot.reply(text);
+      }
+    }
+  } catch {
+    // если картинка не отправилась — шлём текстом
+    if (ctxOrBot.telegram) {
+      await ctxOrBot.telegram.sendMessage(chatId, text);
+    } else {
+      await ctxOrBot.reply(text);
+    }
+  }
 }
 
-// /start
+// ====== КОМАНДЫ ======
 bot.start(async (ctx) => {
   const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
+  ensureChat(chatId, ctx.chat.type);
 
-  // По умолчанию поставим +04:00 (Тбилиси), если ещё не выставлен
-  if (store[chatId].tz_offset === '+00:00') {
-    store[chatId].tz_offset = '+04:00';
-    saveStore(store);
+  if (isGroup(ctx)) {
+    return ctx.reply('Бот активирован. Пиши /date чтобы посмотреть, сколько дней осталось.');
   }
-
-  await ctx.reply(
+  return ctx.reply(
 `Привет! Я считаю, сколько дней осталось до заданной даты.
 
-Команды:
+Команды (для владельца):
 /setdate 2025-09-10  — установить дату (или 10.09.2025)
 /tz +04:00           — установить часовой пояс
-/left                — показать, сколько осталось
-/when                — показать дату
-/notify              — вкл/выкл авто-сообщение в 08:00
-/clear               — сбросить дату
-/menu                — открыть меню-кнопки`,
-    menuKeyboard(chatId)
+
+Для всех:
+/date                 — сколько дней осталось (с картинкой)
+`
   );
 });
 
-// /menu — показать кнопки
-bot.command('menu', (ctx) => {
+// /date — доступно всем (и в группах, и в личке)
+bot.command(['date', 'left'], (ctx) => {
   const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
-  return ctx.reply('Меню:', menuKeyboard(chatId));
+  ensureChat(chatId, ctx.chat.type);
+
+  const cfg = store[chatId];
+  if (!cfg.target_date) {
+    if (isGroup(ctx)) {
+      return ctx.reply('Дата не установлена. Владелец может задать её командой /setdate 2025-09-10');
+    }
+    return ctx.reply('Дата не установлена. Задай: /setdate 2025-09-10');
+  }
+
+  const days = calcDaysLeft(cfg.target_date, cfg.tz_offset);
+  const text = `${mainLine(days)}\n${dailyExtraLine(cfg.tz_offset)}`;
+  return sendWithRandomImage(ctx, chatId, text);
 });
 
-// /setdate
+// /setdate — ТОЛЬКО владелец (в группах)
+// формат: YYYY-MM-DD или DD.MM.YYYY
 bot.command('setdate', (ctx) => {
   const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
+  ensureChat(chatId, ctx.chat.type);
+
+  if (isGroup(ctx) && !isOwner(ctx)) return; // игнор
+  if (!isGroup(ctx) && !isOwner(ctx)) {
+    // в личке тоже ограничим изменение даты только владельцу
+    return;
+  }
 
   const arg = ctx.message.text.replace(/^\/setdate(@\w+)?\s*/i, '').trim();
   if (!arg) return ctx.reply('Напиши дату: /setdate 2025-09-10 или /setdate 10.09.2025');
@@ -142,13 +202,15 @@ bot.command('setdate', (ctx) => {
 
   const days = calcDaysLeft(store[chatId].target_date, store[chatId].tz_offset);
   const text = `${mainLine(days)}\n${dailyExtraLine(store[chatId].tz_offset)}`;
-  ctx.reply(`Дата установлена: ${dt.toFormat('dd.LL.yyyy')}\n\n${text}`, menuKeyboard(chatId));
+  return ctx.reply(`Дата установлена: ${dt.toFormat('dd.LL.yyyy')}\n\nКоманда для всех: /date\n\n${text}`);
 });
 
-// /tz
+// /tz — ТОЛЬКО владелец
 bot.command('tz', (ctx) => {
   const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
+  ensureChat(chatId, ctx.chat.type);
+
+  if (!isOwner(ctx)) return; // только владелец
 
   const arg = ctx.message.text.replace(/^\/tz(@\w+)?\s*/i, '').trim();
   const norm = normalizeTzOffset(arg);
@@ -156,92 +218,15 @@ bot.command('tz', (ctx) => {
 
   store[chatId].tz_offset = norm;
   saveStore(store);
-  ctx.reply(`Часовой пояс установлен: ${norm}`, menuKeyboard(chatId));
+  return ctx.reply(`Часовой пояс установлен: ${norm}`);
 });
 
-// /left
-bot.command('left', (ctx) => {
-  const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
-
-  const cfg = store[chatId];
-  if (!cfg.target_date) return ctx.reply('Дата не установлена. Сначала: /setdate 2025-09-10');
-
-  const days = calcDaysLeft(cfg.target_date, cfg.tz_offset);
-  const text = `${mainLine(days)}\n${dailyExtraLine(cfg.tz_offset)}`;
-  ctx.reply(text, menuKeyboard(chatId));
+// игнор любых прочих сообщений
+bot.on('message', (ctx) => {
+  if (!ctx.message.text?.startsWith('/')) return; // не отвечаем на болтовню
 });
 
-// /when
-bot.command('when', (ctx) => {
-  const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
-
-  const cfg = store[chatId];
-  if (!cfg.target_date) return ctx.reply('Дата не установлена. /setdate 2025-09-10');
-  const zone = `UTC${cfg.tz_offset}`;
-  const target = DateTime.fromISO(cfg.target_date, { zone });
-  ctx.reply(`Установленная дата: ${target.toFormat('dd.LL.yyyy')} (${cfg.tz_offset})`, menuKeyboard(chatId));
-});
-
-// /notify — включить/выключить ежедневные сообщения 08:00
-bot.command('notify', (ctx) => {
-  const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
-  store[chatId].notify = !store[chatId].notify;
-  saveStore(store);
-  ctx.reply(store[chatId].notify ? 'Ежедневные сообщения в 08:00: ВКЛ.' : 'Ежедневные сообщения в 08:00: ВЫКЛ.', menuKeyboard(chatId));
-});
-
-// /clear
-bot.command('clear', (ctx) => {
-  const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
-  store[chatId].target_date = null;
-  saveStore(store);
-  ctx.reply('Дата сброшена.', menuKeyboard(chatId));
-});
-
-// Обработчики нажатий кнопок
-bot.action('ACTION_LEFT', async (ctx) => {
-  const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
-  const cfg = store[chatId];
-  if (!cfg.target_date) return ctx.answerCbQuery('Сначала установи дату: /setdate');
-  const days = calcDaysLeft(cfg.target_date, cfg.tz_offset);
-  const text = `${mainLine(days)}\n${dailyExtraLine(cfg.tz_offset)}`;
-  await ctx.editMessageText(text, menuKeyboard(chatId));
-});
-bot.action('ACTION_WHEN', async (ctx) => {
-  const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
-  const cfg = store[chatId];
-  if (!cfg.target_date) return ctx.answerCbQuery('Дата не установлена.');
-  const zone = `UTC${cfg.tz_offset}`;
-  const target = DateTime.fromISO(cfg.target_date, { zone });
-  await ctx.editMessageText(`Установленная дата: ${target.toFormat('dd.LL.yyyy')} (${cfg.tz_offset})`, menuKeyboard(chatId));
-});
-bot.action('ACTION_TOGGLE_NOTIFY', async (ctx) => {
-  const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
-  store[chatId].notify = !store[chatId].notify;
-  saveStore(store);
-  await ctx.editMessageText(store[chatId].notify ? 'Ежедневные сообщения в 08:00: ВКЛ.' : 'Ежедневные сообщения в 08:00: ВЫКЛ.', menuKeyboard(chatId));
-});
-bot.action('ACTION_TZ_HELP', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply('Установи часовой пояс командой, пример: /tz +04:00');
-});
-bot.action('ACTION_CLEAR', async (ctx) => {
-  const chatId = String(ctx.chat.id);
-  ensureChat(chatId);
-  store[chatId].target_date = null;
-  saveStore(store);
-  await ctx.editMessageText('Дата сброшена.', menuKeyboard(chatId));
-});
-
-// === Планировщик 08:00 для каждого чата ===
-// Каждую минуту проверяем: если у чата notify=on и сейчас 08:00 в его поясе — шлём сообщение 1 раз в день.
+// ====== ПЛАНИРОВЩИК: каждую минуту проверяем 08:00 ======
 setInterval(async () => {
   for (const chatId of Object.keys(store)) {
     const cfg = store[chatId];
@@ -249,24 +234,23 @@ setInterval(async () => {
 
     const zone = `UTC${cfg.tz_offset}`;
     const now = DateTime.now().setZone(zone);
-    const isEight = now.hour === 8 && now.minute === 0;
+    const isEight = (now.hour === 8 && now.minute === 0);
     const today = now.startOf('day').toISODate();
 
     if (isEight && cfg.last_notified_iso !== today) {
       try {
         const days = calcDaysLeft(cfg.target_date, cfg.tz_offset);
         const text = `${mainLine(days)}\n${dailyExtraLine(cfg.tz_offset)}`;
-        await bot.telegram.sendMessage(chatId, text);
+        await sendWithRandomImage(bot, chatId, text);
         cfg.last_notified_iso = today;
         saveStore(store);
       } catch (e) {
-        // молча пропустим, чтобы цикл не падал
+        console.error('notify error:', e.message);
       }
     }
   }
-}, 60 * 1000); // раз в минуту
+}, 60 * 1000);
 
-// Запуск бота
-bot.launch().then(() => console.log('Бот запущен (меню + авто-08:00)'));
+bot.launch().then(() => console.log('Бот запущен (owner-only admin, /date, фото, авто-08:00)'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
